@@ -1,5 +1,7 @@
 import React, {
+  useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   ChangeEvent,
@@ -8,13 +10,22 @@ import React, {
 } from "react";
 import "./index.css";
 
-// Uploaded placeholder image (will be served from your environment)
+// Local placeholder image (from your uploads)
 const PLACEHOLDER_IMG = "/mnt/data/fbc2eec3-62d4-4b45-9e9a-047eb55943d9.png";
 
 const API_BASE =
   import.meta.env.MODE === "production" ? "" : "http://localhost:8000";
 
 type Nullable<T> = T | null;
+type Mode = "embed" | "preview" | "extract";
+
+/**
+ * PERFORMANCE NOTES:
+ * - Handlers are stable (useCallback / useMemo) to avoid re-renders.
+ * - Particle system uses a small N, avoids allocations each frame.
+ * - Image previews use object URLs with proper cleanup.
+ * - Minimal state: derived values are computed with useMemo.
+ */
 
 function bytesToNiceSize(bytes?: number) {
   if (!bytes && bytes !== 0) return "—";
@@ -61,15 +72,12 @@ function passwordStrength(password: string) {
   return { score, label, entropy: Math.round(entropy) } as any;
 }
 
-type Mode = "embed" | "preview" | "extract";
-
 export default function App(): JSX.Element {
-  // state
   const [mode, setMode] = useState<Mode>("embed");
   const [focusMode, setFocusMode] = useState(false);
 
-  const [imageFile, setImageFile] = useState<Nullable<File>>(null); // embed
-  const [extractFile, setExtractFile] = useState<Nullable<File>>(null); // extract
+  const [imageFile, setImageFile] = useState<Nullable<File>>(null);
+  const [extractFile, setExtractFile] = useState<Nullable<File>>(null);
   const [hidePreview, setHidePreview] = useState<Nullable<string>>(null);
   const [extractPreview, setExtractPreview] = useState<Nullable<string>>(null);
 
@@ -77,8 +85,10 @@ export default function App(): JSX.Element {
   const [password, setPassword] = useState("");
   const [extractedMessage, setExtractedMessage] =
     useState<Nullable<string>>(null);
+
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<Nullable<string>>(null);
+
   const [capacityBits, setCapacityBits] = useState<Nullable<number>>(null);
   const [fileSizeBytes, setFileSizeBytes] = useState<Nullable<number>>(null);
   const [dragActive, setDragActive] = useState(false);
@@ -89,28 +99,19 @@ export default function App(): JSX.Element {
   const cardRef = useRef<HTMLDivElement | null>(null);
   const idleTimeout = useRef<number | null>(null);
 
-  // particle canvas
+  // particles (canvas)
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const animationRef = useRef<number | null>(null);
+  const particlesRef = useRef<any[]>([]);
 
   // abort controller
   const abortRef = useRef<Nullable<AbortController>>(null);
 
-  const pw = passwordStrength(password);
+  const pw = useMemo(() => passwordStrength(password), [password]);
 
-  // keyboard shortcuts
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if (e.key === "h" || e.key === "H") setMode("embed");
-      if (e.key === "p" || e.key === "P") setMode("preview");
-      if (e.key === "e" || e.key === "E") setMode("extract");
-      if (e.key === "f" || e.key === "F") setFocusMode((s) => !s);
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // previews & capacities
+  /* ------------------------
+     Previews & capacity
+     ------------------------ */
   useEffect(() => {
     if (!imageFile) {
       setHidePreview(null);
@@ -121,10 +122,20 @@ export default function App(): JSX.Element {
     const url = URL.createObjectURL(imageFile);
     setHidePreview(url);
     setFileSizeBytes(imageFile.size);
+
+    // calculate capacity asynchronously
+    let mounted = true;
     calcImageCapacityBits(imageFile)
-      .then((c) => setCapacityBits(c))
-      .catch(() => setCapacityBits(null));
-    return () => URL.revokeObjectURL(url);
+      .then((c) => {
+        if (mounted) setCapacityBits(c);
+      })
+      .catch(() => {
+        if (mounted) setCapacityBits(null);
+      });
+    return () => {
+      mounted = false;
+      URL.revokeObjectURL(url);
+    };
   }, [imageFile]);
 
   useEffect(() => {
@@ -137,62 +148,88 @@ export default function App(): JSX.Element {
     return () => URL.revokeObjectURL(url);
   }, [extractFile]);
 
-  // particles (small) - reuse previous lightweight system
+  /* ------------------------
+     Lightweight particle system
+     - Small N
+     - Reuses single particle array, avoids GC
+     - Stops when focusMode enabled
+     ------------------------ */
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    const ctx = canvas.getContext("2d")!;
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    let running = true;
     const DPR = window.devicePixelRatio || 1;
 
     function resize() {
-      canvas.width = canvas.clientWidth * DPR;
-      canvas.height = canvas.clientHeight * DPR;
+      canvas.width = Math.max(300, canvas.clientWidth) * DPR;
+      canvas.height = Math.max(200, canvas.clientHeight) * DPR;
       ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     }
     resize();
 
-    const particles: any[] = [];
-    const N = Math.max(
-      30,
-      Math.round((canvas.clientWidth * canvas.clientHeight) / 20000)
-    );
-    for (let i = 0; i < N; i++) {
-      particles.push({
-        x: Math.random() * canvas.clientWidth,
-        y: Math.random() * canvas.clientHeight,
-        r: 0.6 + Math.random() * 1.8,
-        vx: (Math.random() - 0.5) * 0.4,
-        vy: (Math.random() - 0.5) * 0.4,
-        hue: 200 + Math.random() * 40,
-        alpha: 0.04 + Math.random() * 0.12,
-      });
+    // keep particle count low for performance
+    const area = canvas.clientWidth * canvas.clientHeight;
+    const N = Math.max(18, Math.round(area / 30000)); // fewer particles
+    const particles = particlesRef.current.length ? particlesRef.current : [];
+    if (!particles.length) {
+      for (let i = 0; i < N; i++) {
+        particles.push({
+          x: Math.random() * canvas.clientWidth,
+          y: Math.random() * canvas.clientHeight,
+          r: 0.6 + Math.random() * 1.6,
+          vx: (Math.random() - 0.5) * 0.35,
+          vy: (Math.random() - 0.5) * 0.35,
+          hue: 200 + Math.random() * 60,
+          alpha: 0.04 + Math.random() * 0.12,
+        });
+      }
     }
 
+    particlesRef.current = particles;
+
     function step() {
-      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-      for (const p of particles) {
-        p.x += p.vx;
-        p.y += p.vy;
-        if (p.x < -10) p.x = canvas.clientWidth + 10;
-        if (p.x > canvas.clientWidth + 10) p.x = -10;
-        if (p.y < -10) p.y = canvas.clientHeight + 10;
-        if (p.y > canvas.clientHeight + 10) p.y = -10;
-        ctx.beginPath();
-        ctx.fillStyle = `hsla(${p.hue}, 80%, 60%, ${p.alpha})`;
-        ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
-        ctx.fill();
+      if (!running) return;
+      if (focusMode) {
+        // small fade-out when focus mode is on
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+      } else {
+        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+        for (let i = 0, L = particles.length; i < L; i++) {
+          const p = particles[i];
+          p.x += p.vx;
+          p.y += p.vy;
+          if (p.x < -10) p.x = canvas.clientWidth + 10;
+          if (p.x > canvas.clientWidth + 10) p.x = -10;
+          if (p.y < -10) p.y = canvas.clientHeight + 10;
+          if (p.y > canvas.clientHeight + 10) p.y = -10;
+          ctx.beginPath();
+          ctx.fillStyle = `hsla(${p.hue}, 75%, 60%, ${p.alpha})`;
+          ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+          ctx.fill();
+        }
       }
       animationRef.current = requestAnimationFrame(step);
     }
+
     animationRef.current = requestAnimationFrame(step);
     const onResize = () => resize();
     window.addEventListener("resize", onResize);
+
     return () => {
+      running = false;
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
       window.removeEventListener("resize", onResize);
     };
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusMode]);
 
+  /* ------------------------
+     Cleanup on unmount
+     ------------------------ */
   useEffect(() => {
     return () => {
       if (idleTimeout.current) {
@@ -203,32 +240,38 @@ export default function App(): JSX.Element {
         abortRef.current.abort();
         abortRef.current = null;
       }
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
   }, []);
 
-  function handleFileInput(setter: (f: File | null) => void) {
-    return (e: ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0] ?? null;
-      setter(file);
-      setError(null);
-    };
-  }
+  /* ------------------------
+     Stable callbacks
+     ------------------------ */
+  const handleFileInput = useCallback(
+    (setter: (f: File | null) => void) =>
+      (e: ChangeEvent<HTMLInputElement>) => {
+        const file = e.target.files?.[0] ?? null;
+        setter(file);
+        setError(null);
+      },
+    []
+  );
 
-  function onDrop(e: React.DragEvent) {
+  const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(false);
     const file = e.dataTransfer.files?.[0] ?? null;
     if (file) setImageFile(file);
-  }
-  function onDragOver(e: React.DragEvent) {
+  }, []);
+
+  const onDragOver = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragActive(true);
-  }
-  function onDragLeave() {
-    setDragActive(false);
-  }
+  }, []);
 
-  function validateHide(): string | null {
+  const onDragLeave = useCallback(() => setDragActive(false), []);
+
+  const validateHide = useCallback((): string | null => {
     if (!imageFile) return "Please choose an image to hide the message in.";
     if (!message.trim()) return "Message can't be empty.";
     if (password.length < 6) return "Password must be at least 6 characters.";
@@ -240,114 +283,123 @@ export default function App(): JSX.Element {
         return `Image too small. Capacity ${capacityBits} bits, needed ~ ${neededBits} bits.`;
     }
     return null;
-  }
+  }, [imageFile, message, password, capacityBits]);
 
-  async function handleHide(e?: FormEvent) {
-    e?.preventDefault();
-    setError(null);
-    setExtractedMessage(null);
+  /* ------------------------
+     Network actions (hide/extract)
+     - keep small + efficient
+     ------------------------ */
+  const handleHide = useCallback(
+    async (e?: FormEvent) => {
+      e?.preventDefault();
+      setError(null);
+      setExtractedMessage(null);
 
-    const validation = validateHide();
-    if (validation) {
-      setError(validation);
-      // smart suggestion: if capacity too small, switch to preview with suggestion
-      if (validation.startsWith("Image too small")) setMode("preview");
-      return;
-    }
-
-    const form = new FormData();
-    form.append("image", imageFile as File);
-    form.append("message", message);
-    form.append("password", password);
-
-    try {
-      setLoading(true);
-      const controller = new AbortController();
-      abortRef.current = controller;
-      const res = await fetch(`${API_BASE}/api/hide`, {
-        method: "POST",
-        body: form,
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const text = await res.text().catch(() => null);
-        throw new Error(text || `Server responded ${res.status}`);
+      const validation = validateHide();
+      if (validation) {
+        setError(validation);
+        if (validation.startsWith("Image too small")) setMode("preview");
+        return;
       }
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "stego-hidden.png";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      // subtle visual success: briefly pulse card
-      if (cardRef.current) {
-        cardRef.current.classList.add("pulse");
-        setTimeout(
-          () => cardRef.current && cardRef.current.classList.remove("pulse"),
-          700
-        );
+
+      const form = new FormData();
+      form.append("image", imageFile as File);
+      form.append("message", message);
+      form.append("password", password);
+
+      try {
+        setLoading(true);
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const res = await fetch(`${API_BASE}/api/hide`, {
+          method: "POST",
+          body: form,
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const text = await res.text().catch(() => null);
+          throw new Error(text || `Server responded ${res.status}`);
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = "stego-hidden.png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+        // pulse feedback
+        if (cardRef.current) {
+          cardRef.current.classList.add("pulse");
+          setTimeout(
+            () => cardRef.current && cardRef.current.classList.remove("pulse"),
+            700
+          );
+        }
+        setMessage("");
+      } catch (err: any) {
+        if (err?.name === "AbortError") setError("Upload cancelled");
+        else setError("Hide failed: " + (err?.message ?? String(err)));
+      } finally {
+        setLoading(false);
+        abortRef.current = null;
       }
-      setMessage("");
-    } catch (err: any) {
-      if (err?.name === "AbortError") setError("Upload cancelled");
-      else setError("Hide failed: " + (err?.message ?? String(err)));
-    } finally {
-      setLoading(false);
-      abortRef.current = null;
-    }
-  }
+    },
+    [imageFile, message, password, validateHide]
+  );
 
-  async function handleExtract(e?: FormEvent) {
-    e?.preventDefault();
-    setError(null);
-    setExtractedMessage(null);
+  const handleExtract = useCallback(
+    async (e?: FormEvent) => {
+      e?.preventDefault();
+      setError(null);
+      setExtractedMessage(null);
 
-    if (!extractFile) {
-      setError("Please choose a stego image to extract from.");
-      return;
-    }
-    if (!password) {
-      setError("Enter the password used to hide the message.");
-      return;
-    }
-
-    const form = new FormData();
-    form.append("image", extractFile);
-    form.append("password", password);
-
-    try {
-      setLoading(true);
-      const controller = new AbortController();
-      abortRef.current = controller;
-      const res = await fetch(`${API_BASE}/api/extract`, {
-        method: "POST",
-        body: form,
-        signal: controller.signal,
-      });
-      if (!res.ok) {
-        const payload = await res.json().catch(() => null);
-        throw new Error(payload?.detail || `Server ${res.status}`);
+      if (!extractFile) {
+        setError("Please choose a stego image to extract from.");
+        return;
       }
-      const data = await res.json();
-      setExtractedMessage(data.message);
-      // switch to preview to show result
-      setMode("preview");
-    } catch (err: any) {
-      if (err?.name === "AbortError") setError("Extraction cancelled");
-      else setError("Extract failed: " + (err?.message ?? String(err)));
-    } finally {
-      setLoading(false);
-      abortRef.current = null;
-    }
-  }
+      if (!password) {
+        setError("Enter the password used to hide the message.");
+        return;
+      }
 
-  function cancelOperation() {
+      const form = new FormData();
+      form.append("image", extractFile);
+      form.append("password", password);
+
+      try {
+        setLoading(true);
+        const controller = new AbortController();
+        abortRef.current = controller;
+        const res = await fetch(`${API_BASE}/api/extract`, {
+          method: "POST",
+          body: form,
+          signal: controller.signal,
+        });
+        if (!res.ok) {
+          const payload = await res.json().catch(() => null);
+          throw new Error(payload?.detail || `Server ${res.status}`);
+        }
+        const data = await res.json();
+        setExtractedMessage(data.message);
+        setMode("preview");
+      } catch (err: any) {
+        if (err?.name === "AbortError") setError("Extraction cancelled");
+        else setError("Extract failed: " + (err?.message ?? String(err)));
+      } finally {
+        setLoading(false);
+        abortRef.current = null;
+      }
+    },
+    [extractFile, password]
+  );
+
+  const cancelOperation = useCallback(() => {
     if (abortRef.current) abortRef.current.abort();
-  }
-  function clearAll() {
+  }, []);
+
+  const clearAll = useCallback(() => {
     setImageFile(null);
     setExtractFile(null);
     setHidePreview(null);
@@ -358,10 +410,10 @@ export default function App(): JSX.Element {
     setError(null);
     setCapacityBits(null);
     setFileSizeBytes(null);
-  }
+  }, []);
 
-  // 3D handlers
-  function handlePointerMove(e: MouseEvent<HTMLDivElement>) {
+  // 3D handlers (stable refs)
+  const handlePointerMove = useCallback((e: MouseEvent<HTMLDivElement>) => {
     if (!cardRef.current) return;
     const rect = cardRef.current.getBoundingClientRect();
     const cx = rect.left + rect.width / 2;
@@ -372,23 +424,27 @@ export default function App(): JSX.Element {
     const ry = Math.max(Math.min(dx / 18, 12), -12);
     setCardTilt({ rx, ry, scale: 1.05 });
     if (idleTimeout.current) window.clearTimeout(idleTimeout.current);
-  }
-  function handlePointerLeave() {
+  }, []);
+
+  const handlePointerLeave = useCallback(() => {
     setCardTilt({ rx: 0, ry: 0, scale: 1 });
     idleTimeout.current = window.setTimeout(() => {
       setCardTilt({ rx: 2.5, ry: -4, scale: 1 });
-    }, 2000);
-  }
-  function toggleFlip() {
-    setCardFlipped((s) => !s);
-  }
+    }, 1500);
+  }, []);
 
-  const composedTransform = `rotateY(${cardFlipped ? 180 : 0}deg) rotateX(${
-    cardTilt.rx
-  }deg) rotateY(${cardTilt.ry}deg) scale(${cardTilt.scale})`;
+  const toggleFlip = useCallback(() => setCardFlipped((s) => !s), []);
 
-  // Smart suggestion helper
-  const suggestion = (() => {
+  const composedTransform = useMemo(
+    () =>
+      `rotateY(${cardFlipped ? 180 : 0}deg) rotateX(${
+        cardTilt.rx
+      }deg) rotateY(${cardTilt.ry}deg) scale(${cardTilt.scale})`,
+    [cardFlipped, cardTilt]
+  );
+
+  // Smart suggestion
+  const suggestion = useMemo(() => {
     if (!capacityBits) return "Select an image to see capacity suggestion.";
     const estimatedEncryptedBytes =
       new TextEncoder().encode(message).length + 128;
@@ -397,11 +453,10 @@ export default function App(): JSX.Element {
       return "Fits ✅ — image can hold your encrypted message.";
     const deficit = Math.ceil((neededBits - capacityBits) / 8);
     return `Too small — message ~${deficit} bytes too large. Recommendation: shorten message or use a larger image.`;
-  })();
+  }, [capacityBits, message]);
 
   return (
     <div className={`dark-page ${focusMode ? "focus-mode" : ""}`}>
-      {/* particle canvas hidden when focus mode is on */}
       <canvas
         ref={canvasRef}
         className={`particles ${focusMode ? "hidden" : ""}`}
@@ -411,7 +466,18 @@ export default function App(): JSX.Element {
         <div className="topbar">
           <div className="brand">
             <div className="logo">
-              <img src="Logo.png" alt="AS" />
+              {/* Use your project logo here, fallback to initials */}
+              <img
+                src="Logo.png"
+                alt="Logo"
+                style={{
+                  width: 50,
+                  height: 50,
+                  objectFit: "cover",
+
+                  borderRadius: 8,
+                }}
+              />
             </div>
             <div>
               <div className="brand-title">
@@ -427,26 +493,26 @@ export default function App(): JSX.Element {
                 className={`seg-btn ${mode === "embed" ? "active" : ""}`}
                 onClick={() => setMode("embed")}
               >
-                Embed (H)
+                Embed
               </button>
               <button
                 className={`seg-btn ${mode === "preview" ? "active" : ""}`}
                 onClick={() => setMode("preview")}
               >
-                Preview (P)
+                Preview
               </button>
               <button
                 className={`seg-btn ${mode === "extract" ? "active" : ""}`}
                 onClick={() => setMode("extract")}
               >
-                Extract (E)
+                Extract
               </button>
             </div>
 
             <button
               className="ghost small"
               onClick={() => setFocusMode((s) => !s)}
-              title="Toggle Focus Mode (F)"
+              title="Toggle Focus Mode"
             >
               {focusMode ? "Exit Focus" : "Focus"}
             </button>
@@ -454,14 +520,13 @@ export default function App(): JSX.Element {
         </div>
 
         <div className="main-grid single-feature">
-          {/* Only render the active panel; each panel has an animated enter/exit via CSS */}
+          {/* EMBED */}
           <section
             className={`panel glass panel-anim ${
               mode === "embed" ? "visible" : "hidden"
             }`}
           >
             <h3 className="panel-title">Embed — hide a secret</h3>
-
             <form
               onSubmit={(e) => {
                 e.preventDefault();
@@ -469,6 +534,7 @@ export default function App(): JSX.Element {
               }}
             >
               <label className="label">Image to embed</label>
+
               <div
                 className={`drop ${dragActive ? "drop-active" : ""}`}
                 onDrop={onDrop}
@@ -559,10 +625,12 @@ export default function App(): JSX.Element {
                   </button>
                 </div>
               </div>
+
               {error && <div className="error">{error}</div>}
             </form>
           </section>
 
+          {/* PREVIEW */}
           <section
             className={`panel glass panel-anim ${
               mode === "preview" ? "visible" : "hidden"
@@ -570,7 +638,7 @@ export default function App(): JSX.Element {
           >
             <h3 className="panel-title">Preview — inspect & quick actions</h3>
             <div className="muted">
-              Only the active feature is shown. Use keyboard: H / P / E / F
+              Only the active feature is shown to keep the UI focused.
             </div>
 
             <div
@@ -581,9 +649,6 @@ export default function App(): JSX.Element {
               onClick={toggleFlip}
               role="button"
               tabIndex={0}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") toggleFlip();
-              }}
             >
               <div className="card-3d" style={{ transform: composedTransform }}>
                 <div className="card-face card-front">
@@ -605,17 +670,13 @@ export default function App(): JSX.Element {
                     <div className="card-actions">
                       <button
                         className="btn"
-                        onClick={() => {
-                          if (imageFile) handleHide();
-                        }}
+                        onClick={() => imageFile && handleHide()}
                       >
                         Embed
                       </button>
                       <button
                         className="ghost"
-                        onClick={() => {
-                          if (extractFile) handleExtract();
-                        }}
+                        onClick={() => extractFile && handleExtract()}
                       >
                         Extract
                       </button>
@@ -630,15 +691,14 @@ export default function App(): JSX.Element {
               <ul className="muted" style={{ marginTop: 8 }}>
                 <li>
                   Focus Mode hides particles and dims chrome to help
-                  concentration (F).
+                  concentration.
                 </li>
-                <li>
-                  Keyboard shortcuts speed up workflows: H/P/E toggles features.
-                </li>
+                <li>Use the segmented control to switch tasks quickly.</li>
               </ul>
             </div>
           </section>
 
+          {/* EXTRACT */}
           <section
             className={`panel glass panel-anim ${
               mode === "extract" ? "visible" : "hidden"
@@ -710,7 +770,7 @@ export default function App(): JSX.Element {
         </div>
 
         <footer className="footer">
-          Built with ❤️ — SecureHide · Keyboard: H/P/E, Focus: F
+          Built with ❤️ — ShadowDrop · Focus mode available
         </footer>
       </div>
     </div>
