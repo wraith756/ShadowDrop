@@ -1,16 +1,8 @@
-import React, {
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  ChangeEvent,
-  FormEvent,
-  MouseEvent,
-} from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, FormEvent, MouseEvent, DragEvent } from "react";
 import "./index.css";
 
-// Local placeholder image (from your uploads)
+// Local placeholder image
 const PLACEHOLDER_IMG = "/mnt/data/fbc2eec3-62d4-4b45-9e9a-047eb55943d9.png";
 
 const API_BASE =
@@ -21,18 +13,18 @@ type Mode = "embed" | "preview" | "extract";
 
 /**
  * PERFORMANCE NOTES:
- * - Handlers are stable (useCallback / useMemo) to avoid re-renders.
- * - Particle system uses a small N, avoids allocations each frame.
+ * - Type-only imports for TS + verbatimModuleSyntax.
+ * - Canvas particles use a stable loop and refs (no re-init on focus toggle).
+ * - 3D card tilt uses refs + direct style updates (no rerender per mouse move).
  * - Image previews use object URLs with proper cleanup.
  * - Minimal state: derived values are computed with useMemo.
  */
 
-function bytesToNiceSize(bytes?: number) {
-  if (!bytes && bytes !== 0) return "—";
-  if ((bytes ?? 0) < 1024) return `${bytes} B`;
-  if ((bytes ?? 0) < 1024 * 1024)
-    return `${((bytes ?? 0) / 1024).toFixed(1)} KB`;
-  return `${((bytes ?? 0) / 1024 / 1024).toFixed(2)} MB`;
+function bytesToNiceSize(bytes?: number | null) {
+  if (bytes === null || bytes === undefined) return "—";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
 }
 
 function calcImageCapacityBits(file: File): Promise<number> {
@@ -69,10 +61,10 @@ function passwordStrength(password: string) {
       : entropy < 60
       ? "Good"
       : "Strong";
-  return { score, label, entropy: Math.round(entropy) } as any;
+  return { score, label, entropy: Math.round(entropy) } as const;
 }
 
-export default function App(): JSX.Element {
+export default function App() {
   const [mode, setMode] = useState<Mode>("embed");
   const [focusMode, setFocusMode] = useState(false);
 
@@ -94,10 +86,10 @@ export default function App(): JSX.Element {
   const [dragActive, setDragActive] = useState(false);
 
   // 3D card
-  const [cardTilt, setCardTilt] = useState({ rx: 0, ry: 0, scale: 1 });
   const [cardFlipped, setCardFlipped] = useState(false);
   const cardRef = useRef<HTMLDivElement | null>(null);
   const idleTimeout = useRef<number | null>(null);
+  const tiltRef = useRef({ rx: 0, ry: 0, scale: 1 });
 
   // particles (canvas)
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -106,6 +98,12 @@ export default function App(): JSX.Element {
 
   // abort controller
   const abortRef = useRef<Nullable<AbortController>>(null);
+
+  // focus mode ref for particles (so we don't rerun effect)
+  const focusModeRef = useRef(focusMode);
+  useEffect(() => {
+    focusModeRef.current = focusMode;
+  }, [focusMode]);
 
   const pw = useMemo(() => passwordStrength(password), [password]);
 
@@ -123,7 +121,6 @@ export default function App(): JSX.Element {
     setHidePreview(url);
     setFileSizeBytes(imageFile.size);
 
-    // calculate capacity asynchronously
     let mounted = true;
     calcImageCapacityBits(imageFile)
       .then((c) => {
@@ -150,36 +147,44 @@ export default function App(): JSX.Element {
 
   /* ------------------------
      Lightweight particle system
-     - Small N
-     - Reuses single particle array, avoids GC
-     - Stops when focusMode enabled
+     - Stable effect (no dependency on focusMode)
+     - Uses refs for focus state
      ------------------------ */
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
+    const canvasEl = canvasRef.current;
+    if (!canvasEl) return;
 
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    const ctxEl = canvasEl.getContext("2d");
+    if (!ctxEl) return;
+
+    // ✅ Freeze non-null references
+    const canvas = canvasEl;
+    const ctx = ctxEl;
 
     let running = true;
     const DPR = window.devicePixelRatio || 1;
+    let width = 0;
+    let height = 0;
 
     function resize() {
-      canvas.width = Math.max(300, canvas.clientWidth) * DPR;
-      canvas.height = Math.max(200, canvas.clientHeight) * DPR;
+      const rect = canvas.getBoundingClientRect();
+      width = Math.max(300, rect.width);
+      height = Math.max(200, rect.height);
+      canvas.width = width * DPR;
+      canvas.height = height * DPR;
       ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     }
+
     resize();
 
-    // keep particle count low for performance
-    const area = canvas.clientWidth * canvas.clientHeight;
-    const N = Math.max(18, Math.round(area / 30000)); // fewer particles
+    const area = width * height;
+    const N = Math.max(18, Math.round(area / 30000));
     const particles = particlesRef.current.length ? particlesRef.current : [];
     if (!particles.length) {
       for (let i = 0; i < N; i++) {
         particles.push({
-          x: Math.random() * canvas.clientWidth,
-          y: Math.random() * canvas.clientHeight,
+          x: Math.random() * width,
+          y: Math.random() * height,
           r: 0.6 + Math.random() * 1.6,
           vx: (Math.random() - 0.5) * 0.35,
           vy: (Math.random() - 0.5) * 0.35,
@@ -188,30 +193,31 @@ export default function App(): JSX.Element {
         });
       }
     }
-
     particlesRef.current = particles;
 
     function step() {
       if (!running) return;
-      if (focusMode) {
-        // small fade-out when focus mode is on
-        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-      } else {
-        ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
+
+      ctx.clearRect(0, 0, width, height);
+
+      if (!focusModeRef.current) {
         for (let i = 0, L = particles.length; i < L; i++) {
           const p = particles[i];
           p.x += p.vx;
           p.y += p.vy;
-          if (p.x < -10) p.x = canvas.clientWidth + 10;
-          if (p.x > canvas.clientWidth + 10) p.x = -10;
-          if (p.y < -10) p.y = canvas.clientHeight + 10;
-          if (p.y > canvas.clientHeight + 10) p.y = -10;
+
+          if (p.x < -10) p.x = width + 10;
+          if (p.x > width + 10) p.x = -10;
+          if (p.y < -10) p.y = height + 10;
+          if (p.y > height + 10) p.y = -10;
+
           ctx.beginPath();
           ctx.fillStyle = `hsla(${p.hue}, 75%, 60%, ${p.alpha})`;
           ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
           ctx.fill();
         }
       }
+
       animationRef.current = requestAnimationFrame(step);
     }
 
@@ -224,8 +230,7 @@ export default function App(): JSX.Element {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
       window.removeEventListener("resize", onResize);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [focusMode]);
+  }, []);
 
   /* ------------------------
      Cleanup on unmount
@@ -257,14 +262,14 @@ export default function App(): JSX.Element {
     []
   );
 
-  const onDrop = useCallback((e: React.DragEvent) => {
+  const onDrop = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragActive(false);
-    const file = e.dataTransfer.files?.[0] ?? null;
+    const file = e.dataTransfer?.files?.[0] ?? null;
     if (file) setImageFile(file);
   }, []);
 
-  const onDragOver = useCallback((e: React.DragEvent) => {
+  const onDragOver = useCallback((e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragActive(true);
   }, []);
@@ -287,7 +292,6 @@ export default function App(): JSX.Element {
 
   /* ------------------------
      Network actions (hide/extract)
-     - keep small + efficient
      ------------------------ */
   const handleHide = useCallback(
     async (e?: FormEvent) => {
@@ -395,10 +399,6 @@ export default function App(): JSX.Element {
     [extractFile, password]
   );
 
-  const cancelOperation = useCallback(() => {
-    if (abortRef.current) abortRef.current.abort();
-  }, []);
-
   const clearAll = useCallback(() => {
     setImageFile(null);
     setExtractFile(null);
@@ -412,36 +412,49 @@ export default function App(): JSX.Element {
     setFileSizeBytes(null);
   }, []);
 
-  // 3D handlers (stable refs)
-  const handlePointerMove = useCallback((e: MouseEvent<HTMLDivElement>) => {
+  /* ------------------------
+     3D card transforms (optimized)
+     ------------------------ */
+  const applyCardTransform = useCallback(() => {
     if (!cardRef.current) return;
-    const rect = cardRef.current.getBoundingClientRect();
-    const cx = rect.left + rect.width / 2;
-    const cy = rect.top + rect.height / 2;
-    const dx = e.clientX - cx;
-    const dy = e.clientY - cy;
-    const rx = Math.max(Math.min(-dy / 18, 12), -12);
-    const ry = Math.max(Math.min(dx / 18, 12), -12);
-    setCardTilt({ rx, ry, scale: 1.05 });
-    if (idleTimeout.current) window.clearTimeout(idleTimeout.current);
-  }, []);
+    const { rx, ry, scale } = tiltRef.current;
+    const flip = cardFlipped ? 180 : 0;
+    cardRef.current.style.transform = `rotateY(${flip}deg) rotateX(${rx}deg) rotateY(${ry}deg) scale(${scale})`;
+  }, [cardFlipped]);
+
+  useEffect(() => {
+    // apply flip change
+    applyCardTransform();
+  }, [applyCardTransform]);
+
+  const handlePointerMove = useCallback(
+    (e: MouseEvent<HTMLDivElement>) => {
+      if (!cardRef.current) return;
+      const rect = cardRef.current.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const dx = e.clientX - cx;
+      const dy = e.clientY - cy;
+      const rx = Math.max(Math.min(-dy / 18, 12), -12);
+      const ry = Math.max(Math.min(dx / 18, 12), -12);
+      tiltRef.current = { rx, ry, scale: 1.05 };
+      if (idleTimeout.current) window.clearTimeout(idleTimeout.current);
+      applyCardTransform();
+    },
+    [applyCardTransform]
+  );
 
   const handlePointerLeave = useCallback(() => {
-    setCardTilt({ rx: 0, ry: 0, scale: 1 });
+    tiltRef.current = { rx: 0, ry: 0, scale: 1 };
+    applyCardTransform();
+    if (idleTimeout.current) window.clearTimeout(idleTimeout.current);
     idleTimeout.current = window.setTimeout(() => {
-      setCardTilt({ rx: 2.5, ry: -4, scale: 1 });
+      tiltRef.current = { rx: 2.5, ry: -4, scale: 1 };
+      applyCardTransform();
     }, 1500);
-  }, []);
+  }, [applyCardTransform]);
 
   const toggleFlip = useCallback(() => setCardFlipped((s) => !s), []);
-
-  const composedTransform = useMemo(
-    () =>
-      `rotateY(${cardFlipped ? 180 : 0}deg) rotateX(${
-        cardTilt.rx
-      }deg) rotateY(${cardTilt.ry}deg) scale(${cardTilt.scale})`,
-    [cardFlipped, cardTilt]
-  );
 
   // Smart suggestion
   const suggestion = useMemo(() => {
@@ -466,7 +479,6 @@ export default function App(): JSX.Element {
         <div className="topbar">
           <div className="brand">
             <div className="logo">
-              {/* Use your project logo here, fallback to initials */}
               <img
                 src="Logo.png"
                 alt="Logo"
@@ -474,7 +486,6 @@ export default function App(): JSX.Element {
                   width: 50,
                   height: 50,
                   objectFit: "cover",
-
                   borderRadius: 8,
                 }}
               />
@@ -650,7 +661,7 @@ export default function App(): JSX.Element {
               role="button"
               tabIndex={0}
             >
-              <div className="card-3d" style={{ transform: composedTransform }}>
+              <div className="card-3d">
                 <div className="card-face card-front">
                   <img
                     src={hidePreview ?? extractPreview ?? PLACEHOLDER_IMG}
