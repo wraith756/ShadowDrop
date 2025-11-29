@@ -6,7 +6,7 @@ import "./index.css";
 const PLACEHOLDER_IMG = "/mnt/data/fbc2eec3-62d4-4b45-9e9a-047eb55943d9.png";
 
 const API_BASE =
-  import.meta.env.MODE === "production" ? "" : "https://shadowdrop.onrender.com/";
+  import.meta.env.MODE === "production" ? "" : "https://shadowdrop.onrender.com/:8000"||"0.0.0.0:8000";
 
 type Nullable<T> = T | null;
 type Mode = "embed" | "preview" | "extract";
